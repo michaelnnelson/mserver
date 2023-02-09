@@ -327,6 +327,7 @@ class Game {
       this.currentPlayer.hand = msg.hand;
     }
     this.updateGameState(msg.board, [[]]);
+    this.broadcastGameState();
 
     if (this.currentPlayer.hand.length === 0) {
       this.resetGameState();
