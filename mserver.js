@@ -125,8 +125,7 @@ class Game {
     this.paused = false;
     for (let player of this.playerMap.values()) {
       if (player.webSocket) {
-        player.webSocket.close();
-        delete player.webSocket;
+        player.webSocket = null;
         player.hand = [];
       }
     }
@@ -328,10 +327,10 @@ class Game {
       this.currentPlayer.hand = msg.hand;
     }
     this.updateGameState(msg.board, [[]]);
-    this.broadcastGameState();
 
     if (this.currentPlayer.hand.length === 0) {
       this.resetGameState();
+      broadcastGameConfigs();
     } else {
       this.nextPlayerIndex++;
       if (this.nextPlayerIndex === this.playerOrder.length) {
