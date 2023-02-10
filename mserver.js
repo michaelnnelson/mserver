@@ -2,10 +2,13 @@ import assert from 'assert'
 import fs from 'fs'
 import { WebSocketServer } from 'ws'
 
-import { Card, cardsToStr, sortSequence, GameInfo, 
+import { Card, cardsToStr, sortSequence, GameInfo, createDeck, shuffleDeck, drawCard,
          PlayerInfo, validateGameInfo, validatePlayerInfo } from '../machiavelli/src/mutils.mjs'
 
-const GAME_CONFIG_DIR = "./game_config/";
+const GAME_DATA_DIR = "./game_data/";
+const CONFIG_SUFFIX = ".config";
+const STATE_SUFFIX = ".state";
+
 var port = 8080;
 var wss = new WebSocketServer({ port: port });
 
@@ -13,36 +16,6 @@ console.log('listening on port: ' + port);
 
 var connectedClients = [];
 var gameMap = new Map();
-
-var cardId = 100;
-
-function createDeck(numDecks, numJokers, numValues, numSuits) {
-  var deck = [];
-
-  for (var i = 0; i < numDecks; i++) {
-    for (var value = 1; value <= numValues; value++) {
-      for (var suit = 0; suit < numSuits; suit++) {
-        deck.push(new Card(value, suit));
-      }
-    }
-  }
-
-  for (i = 0; i < numJokers; i++) {
-    var card = new Card(0, 0, true);
-    deck.push(card);
-  }
-  return deck;
-}
-
-function shuffleDeck(deck) {
-  var shuffledDeck = [];
-  while (deck.length > 0) {
-    let index = Math.floor(Math.random() * deck.length);
-    let card = deck.splice(index, 1);
-    shuffledDeck.push(card[0]);
-  }
-  return shuffledDeck;
-}
 
 function sendError(ws, incomingMsg, msgString, playerId = -1) {
   var msg = {
@@ -71,10 +44,14 @@ function sendSuccess(ws, incomingMsg, playerId = -1) {
 var nextPlayerId = 1000; 
 
 class Player {
-  constructor(name, isBot) {
+  constructor(name, isBot, id) {
     this.name = name;
     this.isBot = isBot;
-    this.id = nextPlayerId++;
+    if (id) {
+      this.id = id;
+    } else {
+      this.id = nextPlayerId++;
+    }
     this.hand = [];
     this.webSocket = null;
   }
@@ -130,15 +107,6 @@ class Game {
       }
     }
   }
-
-  drawCard(hand) {
-    console.log("Deck length", this.deck.length);
-    var card = this.deck.splice(0, 1)[0];
-    assert(card);
-    hand.push(card);
-    sortSequence(hand);
-    return card;
-  }
   
   dealCards(cardsPerHand, numHands) {
     var hands = [];
@@ -147,11 +115,27 @@ class Game {
     }
     for (i = 0; i < numHands; i++) {
       for (var j = 0; j < cardsPerHand; j++) {
-        this.drawCard(hands[i]);
+        drawCard(hands[i], this.deck);
       }
     }
   
     return hands;
+  }
+
+  configFilePath() {
+    return GAME_DATA_DIR + this.gameName + CONFIG_SUFFIX;
+  }
+
+  tmpConfigFilePath() {
+    return GAME_DATA_DIR + "_" + this.gameName + CONFIG_SUFFIX;
+  }
+
+  stateFilePath() {
+    return GAME_DATA_DIR + this.gameName + STATE_SUFFIX;
+  }
+
+  tmpStateFilePath() {
+    return GAME_DATA_DIR + "_" + this.gameName + STATE_SUFFIX;
   }
   
   createGameStateMsg() {
@@ -167,6 +151,7 @@ class Game {
     return({
         type: "GameStateUpdate", 
         version: this.stateVersion,
+        handNumber: this.handNumber,
         board: this.board, 
         buckets: this.buckets, 
         playerInfo: playerInfo
@@ -216,6 +201,9 @@ class Game {
     }
     player.webSocket = ws;
     player.sendSuccessStatus(msg);
+    if (this.active) {
+      this.sendGameState(player);
+    }
     for (let player of this.playerMap.values()) {
       if (!player.webSocket && !player.isBot) {
         return true;
@@ -268,10 +256,24 @@ class Game {
     }
     player.sendSuccessStatus(msg);    
     player.webSocket = null;
+    assert(this.active);
+    this.paused = true;
     broadcastGameConfigs();
     return true;
   }
 
+  abortGame(ws, msg) {
+    console.log("Aborting game", msg.gameName);
+    if (!this.active) {
+      return sendError(ws, msg, this.gameName + "isn't active");
+    } else {
+      this.resetGameState();
+      broadcastGameConfigs();
+      fs.rm(this.stateFilePath(), () => {});
+      sendSuccess(ws, msg);
+    }
+  }
+  
   updateGameState(board, buckets, hand) {
     if (board) {
       this.board = board;
@@ -309,7 +311,70 @@ class Game {
     for (let player of this.playerMap.values()) {
       players.push(new PlayerInfo(player.name, player.isBot, player.webSocket !== null));
     }
-    configs.push(new GameInfo(this.gameName, this.cardsPerHand, players));
+    configs.push(new GameInfo(this.gameName, this.cardsPerHand, players, this.active));
+  }
+
+  setGameState(gameState) {
+    if (this.playerMap.size !== gameState.players.length) {
+      console.log("There are", this.playerMap.size, "configs but", gameState.players.length, "players in the saved state");
+      return;
+    }
+    this.active = true;
+    this.paused = true;
+    this.stateVersion = gameState.stateVersion;
+    this.handNumber = gameState.handNumber;
+    this.nextPlayerIndex = gameState.nextPlayerIndex;
+    this.board = gameState.board;
+    this.deck = gameState.deck;
+    this.currentPlayer = this.playerMap.get(this.playerOrder[this.nextPlayerIndex]);
+
+    gameState.players.forEach(gameStatePlayer => {
+      let player = this.playerMap.get(gameStatePlayer.name);
+      if (!player) {
+        console.log("Player", gameStatePlayer.name, "is missing from the config");
+        return;
+      }     
+      assert(player.isBot === gameStatePlayer.isBot);
+      player.id = gameStatePlayer.id;
+      player.hand = gameStatePlayer.hand;
+    });
+  }
+
+  persistGameState(handDoneWebSocket, handDoneMsg) {
+    var players = [];
+    for (let player of this.playerMap.values()) {
+      players.push({
+        name: player.name,
+        isBot: player.isBot,
+        id: player.id,
+        hand: player.hand
+      });
+    }
+    let persistedState = {
+      gameName: this.gameName,
+      stateVersion: this.stateVersion,
+      handNumber: this.handNumber,
+      nextPlayerIndex: this.nextPlayerIndex,
+      board: this.board,
+      players: players,
+      deck: this.deck
+    };
+
+    fs.writeFile(this.tmpStateFilePath(), JSON.stringify(persistedState), err => {
+      if (err) {
+        console.error("writeFile of " + this.tmpStateFilePath() + " failed with", err);
+        this.finishHandDone(handDoneWebSocket, handDoneMsg, "Failed to save state");
+      } else {
+        fs.rename(this.tmpStateFilePath(), this.stateFilePath(), err => {
+          if (err) {
+            console.log("rename of " + this.tmpStateFilePath() + " to " + this.stateFilePath() + " failed with", err);
+            this.finishHandDone(handDoneWebSocket, handDoneMsg, "Failed to save state");
+          } else {
+            this.finishHandDone(handDoneWebSocket, handDoneMsg);
+          }
+        });
+      }
+    });
   }
 
   handDone(ws, msg) {
@@ -320,31 +385,41 @@ class Game {
       return sendError(ws, msg, 
                        "Invalid hand number:" + msg.handNumber + "!==" + this.handNumber);
     }
-    sendSuccess(ws, msg);
     if (msg.drawCard) {
-      this.drawCard(this.currentPlayer.hand);
+      drawCard(this.currentPlayer.hand, this.deck);
     } else {
       this.currentPlayer.hand = msg.hand;
     }
     this.updateGameState(msg.board, [[]]);
-    this.broadcastGameState();
 
     if (this.currentPlayer.hand.length === 0) {
+      this.broadcastGameState();
       this.resetGameState();
       broadcastGameConfigs();
+      fs.rm(this.stateFilePath(), () => {});
     } else {
       this.nextPlayerIndex++;
       if (this.nextPlayerIndex === this.playerOrder.length) {
         this.nextPlayerIndex = 0;
       }
       this.handNumber++;
+      this.persistGameState(ws, msg);
+    }
+  }
+
+  finishHandDone(ws, msg, err) {
+    console.log("finishHandDone", err);
+    if (err) {
+      sendError(ws, msg, err);
+    } else {
+      sendSuccess(ws, msg);
+      this.broadcastGameState();
       this.playHand();
     }
   }
 
   playHand() {        
-    let player = this.playerMap.get(this.playerOrder[this.nextPlayerIndex]);
-    this.currentPlayer = player;
+    this.currentPlayer = this.playerMap.get(this.playerOrder[this.nextPlayerIndex]);;
     this.sendPlayHandMsg();
   }
 
@@ -371,6 +446,12 @@ class Game {
     if (this.paused) {
       delete this.paused;
       assert(this.currentPlayer);
+      for (let player of this.playerMap.values()) {
+        if (player.webSocket) {
+          this.dealer = player;
+          break;
+        }
+      }
       this.broadcastGameState();
       this.sendPlayHandMsg();
     } else {
@@ -454,6 +535,13 @@ function processLeaveGameMsg(ws, msg) {
   }
 }
 
+function processAbortGameMsg(ws, msg) {
+  let game = lookupGame(ws, msg);
+  if (game) {
+    game.abortGame(ws, msg);
+  }
+}
+
 function processDeleteGameMsg(ws, msg) {
   let game = lookupGame(ws, msg);
   if (game) {
@@ -462,10 +550,9 @@ function processDeleteGameMsg(ws, msg) {
       return sendError(ws, msg, errMsg);
     } else {
       gameMap.delete(msg.gameName);
-      let filePath = GAME_CONFIG_DIR + msg.gameName;
-      fs.rm(filePath, err => {
+      fs.rm(this.configFilePath(), err => {
         if (err) {
-          console.log("Failed to remove file", filePath);
+          console.log("Failed to remove file", this.configFilePath(), err);
         }
       })
       broadcastGameConfigs();
@@ -511,22 +598,22 @@ function processConfigGameMsg(ws, msg) {
     sendError(ws, msg, "Need at least one real person in game");
     return;
   }
+
   var game = gameMap.get(msg.config.gameName);
   if (game) {
     if (!game.validateNewConfig(ws, msg, newPlayerMap)) {
       return;
     }
   }
+  
   gameMap.set(msg.config.gameName, new Game(msg.config.gameName, newPlayerOrder, newPlayerMap, msg.config.cardsPerHand));
-  let tFilePath = GAME_CONFIG_DIR + "_" + msg.config.gameName;
-  let filePath = GAME_CONFIG_DIR + msg.config.gameName;
-  fs.writeFile(tFilePath, JSON.stringify(msg.config), err => {
+  fs.writeFile(this.tmpConfigFilePath(), JSON.stringify(msg.config), err => {
     if (err) {
-      console.error("writeFile of " + tFilePath + " failed with", err);
+      console.error("writeFile of " + this.tmpConfigFilePath() + " failed with", err);
     } else {
-      fs.rename(tFilePath, filePath, err => {
+      fs.rename(this.tmpConfigFilePath(), this.configFilePath(), err => {
         if (err) {
-          console.log("rename of " + tFilePath + " to " + filePath + " failed with", err);
+          console.log("rename of " + this.tmpConfigFilePath() + " to " + this.configFilePath() + " failed with", err);
         }
       });
     }
@@ -561,20 +648,31 @@ function broadcastGameConfigs() {
   });
 }
 
-fs.readdir(GAME_CONFIG_DIR, function(err, filenames) {
+fs.readdir(GAME_DATA_DIR, function(err, filenames) {
   if (err) {
-    console.log("Error opening", GAME_CONFIG_DIR, err);
+    console.log("Error opening", GAME_DATA_DIR, err);
     return;
   }
+  
+  var configsToRead = [];
+  var statesToRead = [];
+  filenames.forEach(fileName => {
+    if (fileName[0] == '_') {
+      fs.rm(GAME_DATA_DIR + fileName, () => {});
+    } else if (fileName.endsWith(CONFIG_SUFFIX)) {
+      configsToRead.push(fileName);
+    } else if (fileName.endsWith(STATE_SUFFIX)) {
+      statesToRead.push(fileName)
+    }
+  });
 
-  filenames.forEach((fileName) => {
-    var path = GAME_CONFIG_DIR + fileName;
+  var configsLeftToRead = configsToRead.length;
+
+  configsToRead.forEach(fileName => {
+    var path = GAME_DATA_DIR + fileName;
     fs.readFile(path, 'utf-8', function(err, content) {
       if (err) {
         console.log("Error reading file", path)
-        return;
-      } else if (fileName[0] === '_') {
-        fs.rm(path, () => {});
         return;
       }
       var gameConfig = JSON.parse(content);
@@ -585,11 +683,37 @@ fs.readdir(GAME_CONFIG_DIR, function(err, filenames) {
       var playerMap = new Map();
       gameConfig.players.forEach((player) => {
         playerOrder.push(player.name);
-        playerMap.set(player.name, new Player(player.name, player.isBot)); 
+        playerMap.set(player.name, new Player(player.name, player.isBot, player.id)); 
       });
       gameMap.set(gameConfig.gameName, new Game(gameConfig.gameName, playerOrder, playerMap, gameConfig.cardsPerHand));
+      configsLeftToRead--;
+      if (configsLeftToRead === 0) {
+        readStateFiles();
+      }
     });
   });
+
+  function readStateFiles() {
+    statesToRead.forEach((fileName) => {
+      var path = GAME_DATA_DIR + fileName;
+      fs.readFile(path, 'utf-8', function(err, content) {
+        if (err) {
+          console.log("Error reading file", path)
+          return;
+        }
+        
+        var gameState = JSON.parse(content);
+        console.log("Read gameState", gameState);
+        assert(gameState.gameName);
+        let game = gameMap.get(gameState.gameName);
+        if (!game) {
+          console.log("No game config for ", gameState.gameName);
+          return;
+        }
+        game.setGameState(gameState);
+      });
+    });
+  }
 });
 
 wss.on('connection', function connection(ws) {
@@ -614,6 +738,9 @@ wss.on('connection', function connection(ws) {
         break;
       case "DeleteGame":
         processDeleteGameMsg(ws, msgObj);
+        break;
+      case "AbortGame":
+        processAbortGameMsg(ws, msgObj);
         break;
       default:
         ws.send('echo: ' + message);
