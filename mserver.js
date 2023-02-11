@@ -3,7 +3,8 @@ import fs from 'fs'
 import { WebSocketServer } from 'ws'
 
 import { Card, cardsToStr, sortSequence, GameInfo, createDeck, shuffleDeck, drawCard,
-         PlayerInfo, validateGameInfo, validatePlayerInfo } from '../machiavelli/src/mutils.mjs'
+         PlayerInfo, validateGameInfo, validatePlayerInfo,
+        GAME_STATE_ACTIVE, GAME_STATE_PAUSED, GAME_STATE_IDLE } from '../machiavelli/src/mutils.mjs'
 
 const GAME_DATA_DIR = "./game_data/";
 const CONFIG_SUFFIX = ".config";
@@ -17,25 +18,25 @@ console.log('listening on port: ' + port);
 var connectedClients = [];
 var gameMap = new Map();
 
-function sendError(ws, incomingMsg, msgString, playerId = -1) {
+function sendError(ws, incomingMsg, msgString, playerName = "") {
   var msg = {
     type: "Status",
     requestId: incomingMsg.requestId,
     status: "Error",
     msg: msgString,
-    playerId: playerId
+    playerName: playerName
   };
   ws.send(JSON.stringify(msg));
   return false;
 }
 
-function sendSuccess(ws, incomingMsg, playerId = -1) {
+function sendSuccess(ws, incomingMsg, playerName = "") {
   var msg = {
     type: "Status",
     requestId: incomingMsg.requestId,
     status: "Ok",
     msg: "Success",
-    playerId: playerId
+    playerName: playerName
   };
   ws.send(JSON.stringify(msg));
   return true;
@@ -44,14 +45,9 @@ function sendSuccess(ws, incomingMsg, playerId = -1) {
 var nextPlayerId = 1000; 
 
 class Player {
-  constructor(name, isBot, id) {
+  constructor(name, isBot) {
     this.name = name;
     this.isBot = isBot;
-    if (id) {
-      this.id = id;
-    } else {
-      this.id = nextPlayerId++;
-    }
     this.hand = [];
     this.webSocket = null;
   }
@@ -60,8 +56,8 @@ class Player {
     if (this.webSocket) {
       console.log("Sending msg", msg);
 
-      if (!msg.playerId) {
-        msg.playerId = this.id;
+      if (!msg.playerName) {
+        msg.playerName = this.name;
       }
       this.webSocket.send(JSON.stringify(msg), err => {
         if (err) {
@@ -78,7 +74,7 @@ class Player {
   }
 
   sendErrorStatus(incomingMsg, errorMsg) {
-    sendError(this.webSocket, incomingMsg, errorMsg, this.id);
+    sendError(this.webSocket, incomingMsg, errorMsg, this.name);
   }
 }
 
@@ -145,11 +141,11 @@ class Game {
       console.log("createGameStateMsg player: hand", cardsToStr(player.hand));
 
       assert(player.hand);
-      playerInfo.push({ name: player.name, id: player.id, hand: player.hand, isBot: player.isBot });
+      playerInfo.push({ name: player.name, hand: player.hand, isBot: player.isBot });
     }
 
     return({
-        type: "GameStateUpdate", 
+        type: "UpdateGameState", 
         version: this.stateVersion,
         handNumber: this.handNumber,
         board: this.board, 
@@ -180,12 +176,12 @@ class Game {
     
     sendSuccess(ws, msg);
     
-    if (msg.handNumber === this.handNumber && msg.playerId === this.currentPlayer.id) {
+    if (msg.handNumber === this.handNumber && msg.playerName === this.currentPlayer.name) {
       this.updateGameState(msg.board, msg.buckets, msg.hand);
       this.broadcastGameState(ws);
     } else {
-      console.log("receiveStateUpdate: got (" + msg.handNumber, ", " + msg.playerId + 
-                  ") want (" + this.handNumber + ", " + this.currentPlayer.id + ")");
+      console.log("receiveStateUpdate: got (" + msg.handNumber, ", " + msg.playerName + 
+                  ") want (" + this.handNumber + ", " + this.currentPlayer.name + ")");
     }
   }
 
@@ -311,7 +307,15 @@ class Game {
     for (let player of this.playerMap.values()) {
       players.push(new PlayerInfo(player.name, player.isBot, player.webSocket !== null));
     }
-    configs.push(new GameInfo(this.gameName, this.cardsPerHand, players, this.active));
+    var gameState;
+    if (this.paused) {
+      gameState = GAME_STATE_PAUSED;
+    } else if (this.active) {
+      gameState = GAME_STATE_ACTIVE;
+    } else {
+      gameState = GAME_STATE_IDLE;
+    }
+    configs.push(new GameInfo(this.gameName, this.cardsPerHand, players, gameState));
   }
 
   setGameState(gameState) {
@@ -335,7 +339,6 @@ class Game {
         return;
       }     
       assert(player.isBot === gameStatePlayer.isBot);
-      player.id = gameStatePlayer.id;
       player.hand = gameStatePlayer.hand;
     });
   }
@@ -346,7 +349,6 @@ class Game {
       players.push({
         name: player.name,
         isBot: player.isBot,
-        id: player.id,
         hand: player.hand
       });
     }
@@ -378,9 +380,9 @@ class Game {
   }
 
   handDone(ws, msg) {
-    if (msg.playerId !== this.currentPlayer.id) {
+    if (msg.playerName !== this.currentPlayer.name) {
       return sendError(ws, msg, 
-                       "Invalid player id:" + msg.playerId + "!==" + this.currentPlayer.id);
+                       "Invalid player name:" + msg.playerName + "!==" + this.currentPlayer.name);
     } else if (msg.handNumber !== this.handNumber) {
       return sendError(ws, msg, 
                        "Invalid hand number:" + msg.handNumber + "!==" + this.handNumber);
@@ -426,7 +428,7 @@ class Game {
   sendPlayHandMsg() {
     var msg = {
       type: "PlayHand", 
-      playerId: this.currentPlayer.id,
+      playerName: this.currentPlayer.name,
       isBot: this.currentPlayer.isBot,
       hand: this.currentPlayer.hand,
       handNumber: this.handNumber
@@ -683,7 +685,7 @@ fs.readdir(GAME_DATA_DIR, function(err, filenames) {
       var playerMap = new Map();
       gameConfig.players.forEach((player) => {
         playerOrder.push(player.name);
-        playerMap.set(player.name, new Player(player.name, player.isBot, player.id)); 
+        playerMap.set(player.name, new Player(player.name, player.isBot)); 
       });
       gameMap.set(gameConfig.gameName, new Game(gameConfig.gameName, playerOrder, playerMap, gameConfig.cardsPerHand));
       configsLeftToRead--;
