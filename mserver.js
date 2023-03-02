@@ -4,7 +4,8 @@ import { WebSocketServer } from 'ws'
 
 import { Card, cardsToStr, sortSequence, GameInfo, createDeck, shuffleDeck, drawCard,
          PlayerInfo, validateGameInfo, validatePlayerInfo,
-        GAME_STATE_ACTIVE, GAME_STATE_PAUSED, GAME_STATE_IDLE } from '../machiavelli/src/mutils.mjs'
+        GAME_STATE_ACTIVE, GAME_STATE_PAUSED, 
+        GAME_STATE_IDLE, GAME_STATE_CONNECTING } from '../machiavelli/src/mutils.mjs'
 
 const GAME_DATA_DIR = "./game_data/";
 const CONFIG_SUFFIX = ".config";
@@ -252,22 +253,19 @@ class Game {
     }
     player.sendSuccessStatus(msg);    
     player.webSocket = null;
-    assert(this.active);
-    this.paused = true;
+    if (this.active) {
+      this.paused = true;
+    }
     broadcastGameConfigs();
     return true;
   }
 
   abortGame(ws, msg) {
     console.log("Aborting game", msg.gameName);
-    if (!this.active) {
-      return sendError(ws, msg, this.gameName + "isn't active");
-    } else {
-      this.resetGameState();
-      broadcastGameConfigs();
-      fs.rm(this.stateFilePath(), () => {});
-      sendSuccess(ws, msg);
-    }
+    this.resetGameState();
+    broadcastGameConfigs();
+    fs.rm(this.stateFilePath(), () => {});
+    sendSuccess(ws, msg);
   }
   
   updateGameState(board, buckets, hand) {
@@ -303,8 +301,12 @@ class Game {
   }
 
   appendConfig(configs) {
+    var playerConnected = false;
     var players = [];
     for (let player of this.playerMap.values()) {
+      if (player.webSocket) {
+        playerConnected = true;
+      }
       players.push(new PlayerInfo(player.name, player.isBot, player.webSocket !== null));
     }
     var gameState;
@@ -312,6 +314,8 @@ class Game {
       gameState = GAME_STATE_PAUSED;
     } else if (this.active) {
       gameState = GAME_STATE_ACTIVE;
+    } else if (playerConnected) {
+      gameState = GAME_STATE_CONNECTING;
     } else {
       gameState = GAME_STATE_IDLE;
     }
