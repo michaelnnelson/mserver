@@ -44,6 +44,7 @@ function sendSuccess(ws, incomingMsg, playerName = "") {
 }
 
 var nextPlayerId = 1000; 
+var nextMsgNumber = 100;
 
 class Player {
   constructor(name, isBot) {
@@ -60,11 +61,11 @@ class Player {
       if (!msg.playerName) {
         msg.playerName = this.name;
       }
+      msg.msgNumber = nextMsgNumber++;
+
       this.webSocket.send(JSON.stringify(msg), err => {
         if (err) {
           console.log("Error sending message", err);
-        } else {
-          console.log("Message sent OK");
         }
       });
     }
@@ -105,12 +106,30 @@ class Game {
     }
   }
   
+  getCard(value, suit, deck) {
+    for (var i = 0; i < deck.length; i++) {
+      let card = deck[i];
+      if (card.value === value && card.suit === suit) {
+        deck.slice(i, 1);
+        return card;
+      }
+    }
+    assert(0);
+  }
+
   dealCards(cardsPerHand, numHands) {
     var hands = [];
     for (var i = 0; i < numHands; i++) {
       hands.push([]);
     }
+
+    for (var i = 1; i < 8; i++) {
+      hands[1].push(this.getCard(i, 0, this.deck));
+    }
     for (i = 0; i < numHands; i++) {
+      if (i === 1) {
+        continue;
+      }
       for (var j = 0; j < cardsPerHand; j++) {
         drawCard(hands[i], this.deck);
       }
@@ -138,9 +157,6 @@ class Game {
   createGameStateMsg() {
     var playerInfo = [];
     for (let player of this.playerMap.values()) {
-      console.log("createGameStateMsg player: name", player.name);      
-      console.log("createGameStateMsg player: hand", cardsToStr(player.hand));
-
       assert(player.hand);
       playerInfo.push({ name: player.name, hand: player.hand, isBot: player.isBot });
     }
@@ -161,6 +177,17 @@ class Game {
     for (let player of this.playerMap.values()) {
       if (player.webSocket !== skipSocket) {
         player.send(gameStateMsg);
+      }
+    }
+  }
+
+  sendWinnerMsg(playerName) {
+    for (let player of this.playerMap.values()) {
+      if (player.webSocket) {
+        player.send({
+          type: "GameWinner",
+          playerName: playerName
+        });
       }
     }
   }
@@ -253,7 +280,11 @@ class Game {
     }
     player.sendSuccessStatus(msg);    
     player.webSocket = null;
-    if (this.active) {
+    if (this.gameCleanupPending) {    
+      if (!this.cleanupGame()) {
+        return;
+      }
+    } else if (this.active) {
       this.paused = true;
     }
     broadcastGameConfigs();
@@ -383,6 +414,20 @@ class Game {
     });
   }
 
+  cleanupGame() {
+    for (let player of this.playerMap.values()) {
+      if (player.webSocket) {
+        console.log("player stil connected", player.name);
+        return false;
+      }
+    }
+    this.gameCleanupPending = false;
+    this.resetGameState();
+    broadcastGameConfigs();
+    fs.rm(this.stateFilePath(), () => {});
+    return true;
+  }
+
   handDone(ws, msg) {
     if (msg.playerName !== this.currentPlayer.name) {
       return sendError(ws, msg, 
@@ -399,10 +444,10 @@ class Game {
     this.updateGameState(msg.board, [[]]);
 
     if (this.currentPlayer.hand.length === 0) {
+      sendSuccess(ws, msg);
       this.broadcastGameState();
-      this.resetGameState();
-      broadcastGameConfigs();
-      fs.rm(this.stateFilePath(), () => {});
+      this.sendWinnerMsg(this.currentPlayer.name);
+      this.gameCleanupPending = true;
     } else {
       this.nextPlayerIndex++;
       if (this.nextPlayerIndex === this.playerOrder.length) {
@@ -476,7 +521,7 @@ class Game {
       assert(this.dealer);
       console.log("Num players", this.playerOrder.length);
       var hands = this.dealCards(this.cardsPerHand, this.playerOrder.length);
-      console.log("hands",)
+
       this.playerOrder.forEach((playerName, index) => {
         var player = this.playerMap.get(playerName);
         assert(player);
@@ -493,6 +538,11 @@ class Game {
       if (player.webSocket === ws) {
         console.log("player", player.name, "disconnected");
         player.webSocket = null;
+        if (this.gameCleanupPending) {
+          if (!this.cleanupGame()) {
+            return;
+          }
+        }
         broadcastGameConfigs();
         if (this.active) {
           this.paused = true;
@@ -632,7 +682,8 @@ function processConfigGameMsg(ws, msg) {
 function sendGameConfigMsg(ws, configs) {
   ws.send(JSON.stringify({ 
     type: "GameConfigs", 
-    configs: configs
+    configs: configs,
+    msgNumber: nextMsgNumber++
   }));
 }
 
