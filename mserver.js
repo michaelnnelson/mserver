@@ -11,9 +11,10 @@ const GAME_DATA_DIR = "./game_data/";
 const CONFIG_SUFFIX = ".config";
 const STATE_SUFFIX = ".state";
 
+var fixedHand;
+
 var port = 8080;
 var wss = new WebSocketServer({ port: port });
-
 console.log('listening on port: ' + port);
 
 var connectedClients = [];
@@ -123,11 +124,13 @@ class Game {
       hands.push([]);
     }
 
-    for (var i = 1; i < 8; i++) {
-      hands[1].push(this.getCard(i, 0, this.deck));
+    if (fixedHand !== undefined) {
+      for (var i = 1; i < cardsPerHand + 1; i++) {
+        hands[fixedHand].push(this.getCard(i, 0, this.deck));
+      }
     }
     for (i = 0; i < numHands; i++) {
-      if (i === 1) {
+      if (i === fixedHand) {
         continue;
       }
       for (var j = 0; j < cardsPerHand; j++) {
@@ -280,11 +283,7 @@ class Game {
     }
     player.sendSuccessStatus(msg);    
     player.webSocket = null;
-    if (this.gameCleanupPending) {    
-      if (!this.cleanupGame()) {
-        return;
-      }
-    } else if (this.active) {
+    if (this.active) {
       this.paused = true;
     }
     broadcastGameConfigs();
@@ -293,6 +292,14 @@ class Game {
 
   abortGame(ws, msg) {
     console.log("Aborting game", msg.gameName);
+    for (let player of this.playerMap.values()) {
+      if (player.webSocket) {
+        player.send({
+          type: "GameAborted",
+          gameName: this.gameName
+        });
+      }
+    }
     this.resetGameState();
     broadcastGameConfigs();
     fs.rm(this.stateFilePath(), () => {});
@@ -414,20 +421,6 @@ class Game {
     });
   }
 
-  cleanupGame() {
-    for (let player of this.playerMap.values()) {
-      if (player.webSocket) {
-        console.log("player stil connected", player.name);
-        return false;
-      }
-    }
-    this.gameCleanupPending = false;
-    this.resetGameState();
-    broadcastGameConfigs();
-    fs.rm(this.stateFilePath(), () => {});
-    return true;
-  }
-
   handDone(ws, msg) {
     if (msg.playerName !== this.currentPlayer.name) {
       return sendError(ws, msg, 
@@ -447,7 +440,9 @@ class Game {
       sendSuccess(ws, msg);
       this.broadcastGameState();
       this.sendWinnerMsg(this.currentPlayer.name);
-      this.gameCleanupPending = true;
+      this.resetGameState();
+      broadcastGameConfigs();
+      fs.rm(this.stateFilePath(), () => {});
     } else {
       this.nextPlayerIndex++;
       if (this.nextPlayerIndex === this.playerOrder.length) {
@@ -538,11 +533,6 @@ class Game {
       if (player.webSocket === ws) {
         console.log("player", player.name, "disconnected");
         player.webSocket = null;
-        if (this.gameCleanupPending) {
-          if (!this.cleanupGame()) {
-            return;
-          }
-        }
         broadcastGameConfigs();
         if (this.active) {
           this.paused = true;
