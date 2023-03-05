@@ -11,7 +11,7 @@ const GAME_DATA_DIR = "./game_data/";
 const CONFIG_SUFFIX = ".config";
 const STATE_SUFFIX = ".state";
 
-var fixedHand;
+var fixedHand = 1;
 
 var port = 8080;
 var wss = new WebSocketServer({ port: port });
@@ -82,8 +82,9 @@ class Player {
 }
 
 class Game {
-  constructor(gameName, playerOrder, playerMap, cardsPerHand) {
+  constructor(gameName, gameId, playerOrder, playerMap, cardsPerHand) {
     this.gameName = gameName;
+    this.gameId = gameId;
     this.playerOrder = playerOrder;
     this.playerMap = playerMap;
     this.cardsPerHand = cardsPerHand;
@@ -142,19 +143,19 @@ class Game {
   }
 
   configFilePath() {
-    return GAME_DATA_DIR + this.gameName + CONFIG_SUFFIX;
+    return GAME_DATA_DIR + this.gameId + CONFIG_SUFFIX;
   }
 
   tmpConfigFilePath() {
-    return GAME_DATA_DIR + "_" + this.gameName + CONFIG_SUFFIX;
+    return GAME_DATA_DIR + "_" + this.gameId + CONFIG_SUFFIX;
   }
 
   stateFilePath() {
-    return GAME_DATA_DIR + this.gameName + STATE_SUFFIX;
+    return GAME_DATA_DIR + this.gameId + STATE_SUFFIX;
   }
 
   tmpStateFilePath() {
-    return GAME_DATA_DIR + "_" + this.gameName + STATE_SUFFIX;
+    return GAME_DATA_DIR + "_" + this.gameId + STATE_SUFFIX;
   }
   
   createGameStateMsg() {
@@ -218,7 +219,7 @@ class Game {
 
   joinGame(ws, msg) {
     let player = this.playerMap.get(msg.playerName);
-    console.log("player", player);
+    console.log("player", player.name);
     if (!player) {
       return sendError(ws, msg, msg.playerName + " is not in the game");
     } else if (player.webSocket) {
@@ -339,6 +340,7 @@ class Game {
   }
 
   appendConfig(configs) {
+    console.log("appendConfig", this.gameId);
     var playerConnected = false;
     var players = [];
     for (let player of this.playerMap.values()) {
@@ -357,7 +359,7 @@ class Game {
     } else {
       gameState = GAME_STATE_IDLE;
     }
-    configs.push(new GameInfo(this.gameName, this.cardsPerHand, players, gameState));
+    configs.push(new GameInfo(this.gameName, this.gameId, this.cardsPerHand, players, gameState));
   }
 
   setGameState(gameState) {
@@ -540,6 +542,34 @@ class Game {
       }
     }
   }
+
+  writeConfigFile(config) {
+    fs.writeFile(this.tmpConfigFilePath(), JSON.stringify(config), err => {
+      if (err) {
+        console.error("writeFile of " + this.tmpConfigFilePath() + " failed with", err);
+      } else {
+        fs.rename(this.tmpConfigFilePath(), this.configFilePath(), err => {
+          if (err) {
+            console.log("rename of " + this.tmpConfigFilePath() + " to " + this.configFilePath() + " failed with", err);
+          }
+        });
+      }
+    });
+  }
+
+  removePersistentState() {
+    fs.rm(this.configFilePath(), err => {
+      if (err) {
+        console.log("Failed to remove file", this.configFilePath(), err);
+      }
+    });
+
+    fs.rm(this.stateFilePath(), err => {
+      if (err) {
+        console.log("Failed to remove file", this.stateFilePath(), err);
+      }
+    });
+  }
 }
 
 function lookupGame(ws, msg) {
@@ -596,11 +626,7 @@ function processDeleteGameMsg(ws, msg) {
       return sendError(ws, msg, errMsg);
     } else {
       gameMap.delete(msg.gameName);
-      fs.rm(this.configFilePath(), err => {
-        if (err) {
-          console.log("Failed to remove file", this.configFilePath(), err);
-        }
-      })
+      game.removePersistentState();
       broadcastGameConfigs();
     }
   }
@@ -645,36 +671,34 @@ function processConfigGameMsg(ws, msg) {
     return;
   }
 
+  var newGameId;
   var game = gameMap.get(msg.config.gameName);
   if (game) {
     if (!game.validateNewConfig(ws, msg, newPlayerMap)) {
       return;
     }
+    newGameId = game.gameId;
+  } else {
+    newGameId = new Date().getTime();
+    msg.config.gameId = newGameId;
   }
   
-  gameMap.set(msg.config.gameName, new Game(msg.config.gameName, newPlayerOrder, newPlayerMap, msg.config.cardsPerHand));
-  fs.writeFile(this.tmpConfigFilePath(), JSON.stringify(msg.config), err => {
-    if (err) {
-      console.error("writeFile of " + this.tmpConfigFilePath() + " failed with", err);
-    } else {
-      fs.rename(this.tmpConfigFilePath(), this.configFilePath(), err => {
-        if (err) {
-          console.log("rename of " + this.tmpConfigFilePath() + " to " + this.configFilePath() + " failed with", err);
-        }
-      });
-    }
-  });
+  game = new Game(msg.config.gameName, newGameId, newPlayerOrder, newPlayerMap, msg.config.cardsPerHand);
+  gameMap.set(msg.config.gameName, game);
+  game.writeConfigFile(msg.config);
 
   sendSuccess(ws, msg);
   broadcastGameConfigs();
 }
 
 function sendGameConfigMsg(ws, configs) {
-  ws.send(JSON.stringify({ 
+  let msg = { 
     type: "GameConfigs", 
     configs: configs,
     msgNumber: nextMsgNumber++
-  }));
+  };
+  console.log("sendGameConfigMsg", msg);
+  ws.send(JSON.stringify(msg));
 }
 
 function sendGameConfigs(ws) {
@@ -732,7 +756,7 @@ fs.readdir(GAME_DATA_DIR, function(err, filenames) {
         playerOrder.push(player.name);
         playerMap.set(player.name, new Player(player.name, player.isBot)); 
       });
-      gameMap.set(gameConfig.gameName, new Game(gameConfig.gameName, playerOrder, playerMap, gameConfig.cardsPerHand));
+      gameMap.set(gameConfig.gameName, new Game(gameConfig.gameName, gameConfig.gameId, playerOrder, playerMap, gameConfig.cardsPerHand));
       configsLeftToRead--;
       if (configsLeftToRead === 0) {
         readStateFiles();
