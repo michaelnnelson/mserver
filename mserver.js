@@ -11,7 +11,7 @@ const GAME_DATA_DIR = "./game_data/";
 const CONFIG_SUFFIX = ".config";
 const STATE_SUFFIX = ".state";
 
-var fixedHand = 1;
+var fixedHand;
 
 var port = 8080;
 var wss = new WebSocketServer({ port: port });
@@ -112,7 +112,7 @@ class Game {
     for (var i = 0; i < deck.length; i++) {
       let card = deck[i];
       if (card.value === value && card.suit === suit) {
-        deck.slice(i, 1);
+        deck.splice(i, 1);
         return card;
       }
     }
@@ -171,7 +171,8 @@ class Game {
         handNumber: this.handNumber,
         board: this.board, 
         buckets: this.buckets, 
-        playerInfo: playerInfo
+        playerInfo: playerInfo,
+        currentPlayerName: this.playerOrder[this.nextPlayerIndex]
     });
   }
 
@@ -210,7 +211,7 @@ class Game {
     
     if (msg.handNumber === this.handNumber && msg.playerName === this.currentPlayer.name) {
       this.updateGameState(msg.board, msg.buckets, msg.hand);
-      this.broadcastGameState(ws);
+      this.broadcastGameState();
     } else {
       console.log("receiveStateUpdate: got (" + msg.handNumber, ", " + msg.playerName + 
                   ") want (" + this.handNumber + ", " + this.currentPlayer.name + ")");
@@ -438,6 +439,10 @@ class Game {
     }
     this.updateGameState(msg.board, [[]]);
 
+    this.nextPlayerIndex++;
+    if (this.nextPlayerIndex === this.playerOrder.length) {
+      this.nextPlayerIndex = 0;
+    }
     if (this.currentPlayer.hand.length === 0) {
       sendSuccess(ws, msg);
       this.broadcastGameState();
@@ -446,10 +451,6 @@ class Game {
       broadcastGameConfigs();
       fs.rm(this.stateFilePath(), () => {});
     } else {
-      this.nextPlayerIndex++;
-      if (this.nextPlayerIndex === this.playerOrder.length) {
-        this.nextPlayerIndex = 0;
-      }
       this.handNumber++;
       this.persistGameState(ws, msg);
     }
