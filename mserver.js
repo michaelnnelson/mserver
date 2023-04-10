@@ -82,12 +82,13 @@ class Player {
 }
 
 class Game {
-  constructor(gameName, gameId, playerOrder, playerMap, cardsPerHand) {
+  constructor(gameName, gameId, playerOrder, playerMap, cardsPerHand, botPlayDelay) {
     this.gameName = gameName;
     this.gameId = gameId;
     this.playerOrder = playerOrder;
     this.playerMap = playerMap;
     this.cardsPerHand = cardsPerHand;
+    this.botPlayDelay = botPlayDelay;
     this.resetGameState();
   }
 
@@ -323,21 +324,25 @@ class Game {
   
   validateNewConfig(ws, msg, newPlayerMap) {
     if (this.active) {
-      sendError(ws, msg, msg.gameName + " is being played");
-      return;
+      return sendError(ws, msg, msg.config.gameName + " is being played");
     }
+    var playerConnected;
     for (let [name, player] of this.playerMap){
       if (player.webSocket) {
         var newPlayer = newPlayerMap.get(name);
         if (!newPlayer) {
-          sendError(ws, msg, 
-                    msg.playerName + " has already joined but is missing from game config");
-          return false;
+          return sendError(ws, msg, 
+                           msg.playerName + " has already joined but is missing from game config");
         }
         newPlayer.webSocket = player.webSocket;
+        playerConnected = true;
       }
     }
-    return true;
+    if (msg.origGameName && playerConnected) {
+      return sendError(ws, msg, "Can't rename a game that anyone has joined");
+    } else {
+      return true;
+    }
   }
 
   appendConfig(configs) {
@@ -360,7 +365,7 @@ class Game {
     } else {
       gameState = GAME_STATE_IDLE;
     }
-    configs.push(new GameInfo(this.gameName, this.gameId, this.cardsPerHand, players, gameState));
+    configs.push(new GameInfo(this.gameName, this.gameId, this.cardsPerHand, this.botPlayDelay, players, gameState));
   }
 
   setGameState(gameState) {
@@ -642,6 +647,8 @@ function processConfigGameMsg(ws, msg) {
     return sendError(ws, msg, "Missing config property");
   } else if (msg.config.players.length < 2) {
     return sendError(ws, msg, "Must have at least 2 players");
+  } else if (msg.origGameName && msg.origGameName === msg.config.gameName) {
+    return sendError(wd, msg, "Told to change game name but new game name is the same as the old game name");
   }
   
   var errMsg = validateGameInfo(msg.config);
@@ -668,12 +675,19 @@ function processConfigGameMsg(ws, msg) {
     }
   }
   if (!foundOneNonBot) {
-    sendError(ws, msg, "Need at least one real person in game");
-    return;
+    return sendError(ws, msg, "Need at least one real person in game");
   }
 
   var newGameId;
-  var game = gameMap.get(msg.config.gameName);
+  var game;
+  if (msg.origGameName) {
+    game = gameMap.get(msg.origGameName);
+    if (!game) {
+      return sendError(ws, msg, "Game '" + msg.origGameName + "' doesn't exist")
+    }
+  } else {
+    game = gameMap.get(msg.config.gameName);
+  }
   if (game) {
     if (!game.validateNewConfig(ws, msg, newPlayerMap)) {
       return;
@@ -684,8 +698,12 @@ function processConfigGameMsg(ws, msg) {
     msg.config.gameId = newGameId;
   }
   
-  game = new Game(msg.config.gameName, newGameId, newPlayerOrder, newPlayerMap, msg.config.cardsPerHand);
+  game = new Game(msg.config.gameName, newGameId, newPlayerOrder, newPlayerMap, msg.config.cardsPerHand, 
+                  msg.config.botPlayDelay);
   gameMap.set(msg.config.gameName, game);
+  if (msg.origGameName) {
+    gameMap.delete(msg.origGameName);
+  }
   game.writeConfigFile(msg.config);
 
   sendSuccess(ws, msg);
@@ -757,7 +775,9 @@ fs.readdir(GAME_DATA_DIR, function(err, filenames) {
         playerOrder.push(player.name);
         playerMap.set(player.name, new Player(player.name, player.isBot)); 
       });
-      gameMap.set(gameConfig.gameName, new Game(gameConfig.gameName, gameConfig.gameId, playerOrder, playerMap, gameConfig.cardsPerHand));
+      gameMap.set(gameConfig.gameName, 
+                  new Game(gameConfig.gameName, gameConfig.gameId, 
+                           playerOrder, playerMap, gameConfig.cardsPerHand, gameConfig.botPlayDelay));
       configsLeftToRead--;
       if (configsLeftToRead === 0) {
         readStateFiles();
