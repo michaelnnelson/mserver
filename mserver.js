@@ -11,6 +11,8 @@ const GAME_DATA_DIR = "./game_data/";
 const CONFIG_SUFFIX = ".config";
 const STATE_SUFFIX = ".state";
 
+const initialConfigVersion = 1;
+
 var fixedHand;
 
 var port = 8080;
@@ -82,9 +84,10 @@ class Player {
 }
 
 class Game {
-  constructor(gameName, gameId, playerOrder, playerMap, cardsPerHand, botPlayDelay) {
+  constructor(gameName, gameId, configVersion, playerOrder, playerMap, cardsPerHand, botPlayDelay) {
     this.gameName = gameName;
     this.gameId = gameId;
+    this.configVersion = configVersion;
     this.playerOrder = playerOrder;
     this.playerMap = playerMap;
     this.cardsPerHand = cardsPerHand;
@@ -365,7 +368,8 @@ class Game {
     } else {
       gameState = GAME_STATE_IDLE;
     }
-    configs.push(new GameInfo(this.gameName, this.gameId, this.cardsPerHand, this.botPlayDelay, players, gameState));
+    configs.push(new GameInfo(this.gameName, this.gameId, this.configVersion, 
+                              this.cardsPerHand, this.botPlayDelay, players, gameState));
   }
 
   setGameState(gameState) {
@@ -678,6 +682,7 @@ function processConfigGameMsg(ws, msg) {
     return sendError(ws, msg, "Need at least one real person in game");
   }
 
+  var newConfigVersion;
   var newGameId;
   var game;
   if (msg.origGameName) {
@@ -693,12 +698,15 @@ function processConfigGameMsg(ws, msg) {
       return;
     }
     newGameId = game.gameId;
+    newConfigVersion = game.configVersion + 1;
   } else {
     newGameId = new Date().getTime();
     msg.config.gameId = newGameId;
+    newConfigVersion = initialConfigVersion;
   }
+  msg.config.configVersion = newConfigVersion;
   
-  game = new Game(msg.config.gameName, newGameId, newPlayerOrder, newPlayerMap, msg.config.cardsPerHand, 
+  game = new Game(msg.config.gameName, newGameId, newConfigVersion, newPlayerOrder, newPlayerMap, msg.config.cardsPerHand, 
                   msg.config.botPlayDelay);
   gameMap.set(msg.config.gameName, game);
   if (msg.origGameName) {
@@ -769,6 +777,12 @@ fs.readdir(GAME_DATA_DIR, function(err, filenames) {
       console.log("Read gameConfig", gameConfig);
       assert(gameConfig.gameName);
       assert(!gameMap.has(gameConfig.gameName));
+      if (!gameConfig.configVersion) {
+        // 
+        // Backward compatible.
+        //
+        gameConfig.configVersion = initialConfigVersion;
+      }
       var playerOrder = [];
       var playerMap = new Map();
       gameConfig.players.forEach((player) => {
@@ -776,7 +790,7 @@ fs.readdir(GAME_DATA_DIR, function(err, filenames) {
         playerMap.set(player.name, new Player(player.name, player.isBot)); 
       });
       gameMap.set(gameConfig.gameName, 
-                  new Game(gameConfig.gameName, gameConfig.gameId, 
+                  new Game(gameConfig.gameName, gameConfig.gameId, gameConfig.configVersion,
                            playerOrder, playerMap, gameConfig.cardsPerHand, gameConfig.botPlayDelay));
       configsLeftToRead--;
       if (configsLeftToRead === 0) {
